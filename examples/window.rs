@@ -1,5 +1,6 @@
 //! Simple winit application.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
@@ -27,6 +28,8 @@ use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMac
 use winit::platform::startup_notify::{
     self, EventLoopExtStartupNotify, WindowAttributesExtStartupNotify, WindowExtStartupNotify,
 };
+#[cfg(wayland_platform)]
+use winit::platform::wayland::ActiveEventLoopExtWayland;
 #[cfg(web_platform)]
 use winit::platform::web::{ActiveEventLoopExtWeb, CustomCursorExtWeb, WindowAttributesExtWeb};
 use winit::window::{
@@ -446,15 +449,24 @@ impl ApplicationHandler for Application {
                     }
                 }
             },
-            WindowEvent::PointerButton { button, state, .. } => {
-                info!("Pointer button {button:?} {state:?}");
-                let mods = window.modifiers;
-                if let Some(action) = state
-                    .is_pressed()
-                    .then(|| Self::process_mouse_binding(button.mouse_button(), &mods))
-                    .flatten()
-                {
-                    self.handle_action_with_window(event_loop, window_id, action);
+            WindowEvent::PointerButton { button, state, position, .. } =>
+            {
+                #[cfg(wayland_platform)]
+                if state.is_pressed() {
+                    let mut winit_state = event_loop.winit_state().borrow_mut();
+
+                    match button.mouse_button() {
+                        MouseButton::Right => {
+                            let logical_position =
+                                position.to_logical::<i32>(window.window.scale_factor());
+                            winit_state.create_popup(window_id, logical_position);
+                        },
+                        _ => {
+                            if let Some(mut popup_state) = winit_state.popup_state.take() {
+                                popup_state.close();
+                            }
+                        },
+                    }
                 }
             },
             WindowEvent::PointerLeft { .. } => {

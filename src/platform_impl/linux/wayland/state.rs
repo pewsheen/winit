@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
+use dpi::{LogicalPosition, LogicalSize};
 use sctk::compositor::{CompositorHandler, CompositorState};
 use sctk::output::{OutputHandler, OutputState};
 use sctk::reexports::calloop::LoopHandle;
@@ -14,12 +15,14 @@ use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 use sctk::registry::{ProvidesRegistryState, RegistryState};
 use sctk::seat::pointer::ThemedPointer;
 use sctk::seat::SeatState;
+use sctk::shell::xdg::popup::{Popup, PopupHandler};
 use sctk::shell::xdg::window::{Window, WindowConfigure, WindowHandler};
-use sctk::shell::xdg::XdgShell;
-use sctk::shell::WaylandSurface;
+use sctk::shell::xdg::{self, XdgPositioner, XdgShell, XdgSurface};
+use sctk::shell::{self, WaylandSurface};
 use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
+use wayland_client::protocol::wl_shm;
 
 use crate::error::OsError;
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
@@ -116,6 +119,57 @@ pub struct WinitState {
 
     /// Whether the user initiated a wake up.
     pub proxy_wake_up: bool,
+
+    /// Popup State
+    pub popup_state: Option<PopupState>,
+}
+
+pub struct PopupState {
+    popup_window: Popup,
+    positioner: XdgPositioner,
+}
+
+impl PopupState {
+    pub fn new(
+        xdg_surface: &wayland_protocols::xdg::shell::client::xdg_surface::XdgSurface,
+        qh: &QueueHandle<WinitState>,
+        compositor: &CompositorState,
+        xdg_shell: &XdgShell,
+        position: LogicalPosition<i32>,
+    ) -> Self {
+        let positioner = XdgPositioner::new(xdg_shell).unwrap();
+        // Anchor vs Offset?
+        positioner.set_anchor_rect(position.x, position.y, 1, 1);
+        positioner.set_offset(130, 180);
+        positioner.set_size(200, 250);
+
+        let popup_window = xdg::popup::Popup::new(
+            &xdg_surface.clone(),
+            &positioner,
+            &qh.clone(),
+            compositor,
+            xdg_shell,
+        )
+        .unwrap();
+
+        Self { popup_window, positioner }
+    }
+    pub fn close(&mut self) {
+        self.popup_window.xdg_popup().destroy();
+    }
+    pub fn reposition(&self, position: LogicalPosition<i32>) {
+        self.positioner.set_anchor_rect(position.x, position.y, 1, 1);
+        self.positioner.set_offset(130, 180);
+        self.popup_window.reposition(&self.positioner, 9527); // What is token doing?
+    }
+}
+
+impl Drop for PopupState {
+    fn drop(&mut self) {
+        dbg!("Dropping popup");
+        self.popup_window.xdg_popup().destroy();
+        self.positioner.destroy();
+    }
 }
 
 impl WinitState {
@@ -194,7 +248,24 @@ impl WinitState {
             // Make it true by default.
             dispatched_events: true,
             proxy_wake_up: false,
+            popup_state: None,
         })
+    }
+
+    pub fn create_popup(&mut self, window_id: WindowId, position: LogicalPosition<i32>) {
+        if let Some(popup_state) = &self.popup_state {
+            popup_state.reposition(position);
+            return;
+        }
+
+        let windows = self.windows.borrow();
+        let window = windows.get(&window_id).unwrap().lock().unwrap();
+        let xdg_surface = window.window.xdg_surface();
+        let qh = window.queue_handle.clone();
+        let popup_state =
+            PopupState::new(xdg_surface, &qh, &self.compositor_state, &self.xdg_shell, position);
+
+        self.popup_state = Some(popup_state);
     }
 
     pub fn scale_factor_changed(
@@ -428,6 +499,82 @@ impl WindowCompositorUpdate {
     }
 }
 
+impl PopupHandler for WinitState {
+    fn configure(
+        &mut self,
+        _conn: &wayland_client::Connection,
+        qh: &wayland_client::QueueHandle<Self>,
+        popup: &shell::xdg::popup::Popup,
+        config: shell::xdg::popup::PopupConfigure,
+    ) {
+        // TODO: draw webview instead of white rectangle
+        dbg!(&config);
+        let width = config.width;
+        let height = config.height;
+        let stride = width as i32 * 4;
+
+        let mut popup_pool =
+            SlotPool::new(512 * 512 * 4, &self.shm).expect("Failed to create pool");
+
+        let mut buffer = popup_pool
+            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+            .expect("create buffer")
+            .0;
+
+        let canvas = match popup_pool.canvas(&buffer) {
+            Some(canvas) => canvas,
+            None => {
+                // This should be rare, but if the compositor has not released the previous
+                // buffer, we need double-buffering.
+                let (second_buffer, canvas) = popup_pool
+                    .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+                    .expect("create buffer");
+                buffer = second_buffer;
+                canvas
+            },
+        };
+
+        // Draw to the window:
+        {
+            canvas.chunks_exact_mut(4).enumerate().for_each(|(_index, chunk)| {
+                let a = 0xFF;
+                let r = 255;
+                let g = 255;
+                let b = 255;
+                let color: u32 = (a << 24) + (r << 16) + (g << 8) + b;
+
+                let array: &mut [u8; 4] = chunk.try_into().unwrap();
+                *array = color.to_le_bytes();
+            });
+        }
+
+        // Damage the entire window
+        popup.wl_surface().damage_buffer(
+            config.position.0,
+            config.position.1,
+            width as i32,
+            height as i32,
+        );
+
+        // Request our next frame
+        popup.wl_surface().frame(qh, popup.wl_surface().clone());
+
+        // Attach and commit to present.
+        buffer.attach_to(popup.wl_surface()).expect("buffer attach");
+        popup.wl_surface().commit();
+    }
+
+    fn done(
+        &mut self,
+        _conn: &wayland_client::Connection,
+        _qh: &wayland_client::QueueHandle<Self>,
+        _popup: &shell::xdg::popup::Popup,
+    ) {
+        println!("------------ DAN DA DAN ------------");
+        self.popup_state.take();
+    }
+}
+
 sctk::delegate_subcompositor!(WinitState);
 sctk::delegate_compositor!(WinitState);
 sctk::delegate_output!(WinitState);
@@ -435,3 +582,4 @@ sctk::delegate_registry!(WinitState);
 sctk::delegate_shm!(WinitState);
 sctk::delegate_xdg_shell!(WinitState);
 sctk::delegate_xdg_window!(WinitState);
+sctk::delegate_xdg_popup!(WinitState);

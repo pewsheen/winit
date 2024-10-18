@@ -4,6 +4,7 @@ pub use event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 pub use output::{MonitorHandle, VideoModeHandle};
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::Proxy;
+pub use state::WinitState;
 pub use window::Window;
 
 pub(super) use crate::cursor::OnlyCursorImage as CustomCursor;

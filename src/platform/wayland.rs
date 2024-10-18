@@ -13,8 +13,11 @@
 //! * `wayland-csd-adwaita` (default).
 //! * `wayland-csd-adwaita-crossfont`.
 //! * `wayland-csd-adwaita-notitle`.
+use std::cell::RefCell;
+
 use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
 use crate::monitor::MonitorHandle;
+pub use crate::platform_impl::wayland::WinitState;
 pub use crate::window::Theme;
 use crate::window::{Window as CoreWindow, WindowAttributes};
 
@@ -22,12 +25,20 @@ use crate::window::{Window as CoreWindow, WindowAttributes};
 pub trait ActiveEventLoopExtWayland {
     /// True if the [`ActiveEventLoop`] uses Wayland.
     fn is_wayland(&self) -> bool;
+    /// Get Winit's Wayland state.
+    fn winit_state(&self) -> &RefCell<WinitState>;
 }
 
 impl ActiveEventLoopExtWayland for dyn ActiveEventLoop + '_ {
     #[inline]
     fn is_wayland(&self) -> bool {
         self.as_any().downcast_ref::<crate::platform_impl::wayland::ActiveEventLoop>().is_some()
+    }
+    #[inline]
+    fn winit_state(&self) -> &RefCell<WinitState> {
+        let active_loop =
+            self.as_any().downcast_ref::<crate::platform_impl::wayland::ActiveEventLoop>().unwrap();
+        &active_loop.state
     }
 }
 
